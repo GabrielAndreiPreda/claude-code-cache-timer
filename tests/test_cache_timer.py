@@ -423,7 +423,10 @@ class TestGitBranch(unittest.TestCase):
                 cwd=ROOT,
                 stdout=subprocess.PIPE,
                 stderr=subprocess.DEVNULL,
-                text=True,
+                # git writes branch names as bytes; decode them the same way
+                # git_branch reads them out of .git/HEAD.
+                encoding="utf-8",
+                errors="replace",
             )
         except OSError:
             self.skipTest("git is not installed")
@@ -445,7 +448,11 @@ class TestSubprocess(TranscriptCase):
             input=payload,
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,
-            text=True,
+            # UTF-8 explicitly, for the same reason install.verify does it: the
+            # status line emits UTF-8 and the system's preferred encoding may not
+            # be able to decode it.
+            encoding="utf-8",
+            errors="replace",
             timeout=20,
             env=environment,
         )
@@ -626,6 +633,50 @@ class TestInstallerVerification(unittest.TestCase):
         self.assertIn("1h", strip_ansi(detail))
         # The context prefix must be covered at install time, not just here.
         self.assertIn("Opus", strip_ansi(detail))
+
+    def test_verify_decodes_the_glyphs_off_a_utf8_locale(self):
+        """The hourglass must not be left to the system's preferred encoding.
+
+        The status line writes UTF-8 whatever the locale says. Decoding it with
+        the preferred encoding instead fails wherever that encoding cannot hold
+        the hourglass, which is every Windows box on a legacy code page. There
+        it fails inside a reader thread, so it neither propagates nor fills the
+        buffer, and a working command is reported as producing no output.
+
+        Run in a child interpreter because the encoding is resolved from the
+        locale at interpreter start and cannot be patched afterwards.
+        """
+        script = (
+            "import sys; sys.path.insert(0, %r);"
+            "from cache_timer import install;"
+            "ok, detail = install.verify("
+            "    install.Candidate([sys.executable, '-m', 'cache_timer'],"
+            "                      [sys.executable, '-m', 'cache_timer']));"
+            "sys.stdout.buffer.write(repr((ok, detail)).encode('utf-8'))"
+        ) % os.path.join(ROOT, "src")
+
+        environment = dict(os.environ)
+        environment["PYTHONPATH"] = os.path.join(ROOT, "src")
+        # A locale whose encoding cannot represent the hourglass. The two
+        # PYTHON* settings stop CPython quietly upgrading C to a UTF-8 locale,
+        # which would defeat the whole test.
+        environment["LC_ALL"] = "C"
+        environment["LANG"] = "C"
+        environment["PYTHONCOERCECLOCALE"] = "0"
+        environment["PYTHONUTF8"] = "0"
+
+        result = subprocess.run(
+            [sys.executable, "-c", script],
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            encoding="utf-8",
+            errors="replace",
+            timeout=30,
+            env=environment,
+        )
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("1:00:00", result.stdout)
+        self.assertTrue(result.stdout.startswith("(True,"), result.stdout)
 
     def test_verify_rejects_a_silent_command(self):
         ok, _ = install.verify(install.Candidate(["true"], ["true"]))

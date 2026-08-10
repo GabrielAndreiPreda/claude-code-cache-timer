@@ -153,7 +153,7 @@ gate that applies to hooks.
 python3 -m unittest discover -s tests
 ```
 
-77 tests covering TTL detection (both buckets, mid-session changes, records too large for
+78 tests covering TTL detection (both buckets, mid-session changes, records too large for
 the tail window), the clock (including a transcript touched long after its last call, and
 the local records that must not reset it), the colour bands, graceful degradation on
 every malformed input, branch

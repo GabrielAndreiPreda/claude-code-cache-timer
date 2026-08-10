@@ -124,7 +124,15 @@ def verify(chosen):
                 stdout=subprocess.PIPE,
                 stderr=subprocess.PIPE,
                 timeout=20,
-                text=True,
+                # The status line forces its own stdout to UTF-8 so the glyphs
+                # survive, so this end has to decode UTF-8 to match. Saying only
+                # `text=True` decodes with the system's preferred encoding, which
+                # off a UTF-8 locale cannot represent the hourglass: on Windows
+                # that raises inside a reader thread, where it neither propagates
+                # nor fills the buffer, so verification sees empty output and
+                # reports a working command as broken.
+                encoding="utf-8",
+                errors="replace",
             )
         except Exception as error:
             return False, "could not run %s: %s" % (chosen.argv[0], error)
