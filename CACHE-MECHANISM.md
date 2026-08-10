@@ -1,6 +1,6 @@
 # How the cache timer knows what it knows
 
-Reference for the mechanism behind `cache_timer_statusline.py`. Every claim here was
+Reference for the mechanism behind `src/cache_timer/statusline.py`. Every claim here was
 checked against Claude Code 2.1.220 and against live session data on 2026-08-07. Where a
 number appears, the method that produced it is given, so you can re-run it when a future
 version breaks something.
@@ -26,37 +26,98 @@ remaining = ttl - (now - last_api_call)
 
 Both terms on the right have to be discovered. Neither is handed to you.
 
-## The clock: transcript mtime
+## The clock: the last assistant turn's timestamp
 
 Claude Code appends every message to
 `~/.claude/projects/<slug>/<session_id>.jsonl`, assistant turns and tool results alike.
-The file's mtime therefore advances on every API call the session makes.
+Each record carries a `timestamp` field, an ISO 8601 string in UTC to the millisecond:
+
+```json
+"timestamp": "2025-01-31T09:15:42.318Z"
+```
 
 The `<slug>` is the working directory with `/`, `\`, `:` and spaces replaced by `-`, the
 leading dash preserved, so `/home/you/Projects/app` becomes `-home-you-Projects-app`.
 You never need to derive it: the status line payload hands you `transcript_path`
 directly.
 
-Two other clocks were candidates and both lose to mtime:
+### Why not the newest record
 
-The last record's `timestamp` field is more semantic, but it costs a tail read to obtain
-and it agrees with mtime anyway. Measured on a live session, mtime age was 15.8s and the
-newest record's timestamp age was 16.0s, a difference of 0.1s. Not worth the extra work.
+The newest record is not the last API call. A transcript logs everything the session
+did, and most of what a session does is local: your own turns, edits, attachments,
+interface state. Many of those records carry a timestamp, and none of them means a
+request went out.
 
-A timestamp written by a hook was the original design and is strictly worse. See "Why
-there are no hooks" below.
+A slash command is the clearest case: running `/exit` or `/clear` appends a timestamped
+record and makes no request at all, so a clock keyed to the newest record restarts on a
+cache nothing touched. Your own turn is the same problem in slower motion — it is
+written when you hit enter, before the request it will eventually trigger.
+
+The marker that does hold is `message.usage`. Only assistant turns carry one, and only
+a response from the API produces one, so it cannot appear without a call having been
+made. The clock is therefore the newest record where `type` is `assistant` and
+`message.usage` is present; every other record is skipped.
+
+Two properties make this durable. It is an allowlist, so a record type added to Claude
+Code in future is ignored by default rather than silently becoming a new way to reset
+the clock. And when it is wrong it is wrong in the safe direction: a missed marker
+anchors further back and understates the remaining cache, where the newest-record clock
+overstated it. Understating costs a cache write you did not have to pay for; overstating
+tells you a cold cache is warm.
+
+### Why not the file's mtime
+
+The mtime is free, and on a live session it agrees: measured mid-conversation, mtime age
+was 15.8s against 16.0s for the newest record. That agreement is what made mtime look
+like the better clock, and it does not hold once a session goes quiet.
+
+Claude Code touches transcript files long after their last API call. A session whose
+newest record is days old can carry an mtime from minutes ago, and an mtime clock reads
+that as most of a 1-hour cache still remaining on a cache that went cold days earlier.
+Every touch restarts the countdown from full, so the failure is silent and the number it
+produces looks plausible.
+
+Reading the timestamp costs nothing extra in practice. The tail is already being read to
+find the TTL, and one backwards walk answers both questions.
 
 ### Verifying the clock
 
+This compares all three clocks across every transcript you have. A row where mtime
+disagrees by hours is a session an mtime countdown would have lied about; a non-zero
+last column is a session the newest-record countdown would have lied about, by that
+many seconds of cache already spent. Sessions that ended on a local record — which is
+common, since local records are written after the last response — are the ones to look
+at.
+
 ```sh
 python3 - <<'EOF'
-import os, time
-p = "<transcript path>"
-print("mtime age: %.1fs" % (time.time() - os.stat(p).st_mtime))
+import glob, json, os, time
+now = time.time()
+for path in sorted(glob.glob(os.path.expanduser("~/.claude/projects/*/*.jsonl"))):
+    newest = api = None
+    with open(path, encoding="utf-8") as handle:
+        for line in handle:
+            try:
+                record = json.loads(line)
+            except ValueError:
+                continue
+            stamp = record.get("timestamp")
+            if not stamp:
+                continue
+            newest = stamp
+            message = record.get("message")
+            if record.get("type") == "assistant" and isinstance(message, dict) \
+                    and isinstance(message.get("usage"), dict):
+                api = stamp
+    print("mtime %7.2fh ago   newest %s   api %s   overstated by %s" %
+          ((now - os.path.getmtime(path)) / 3600, newest, api,
+           "?" if not (newest and api) else
+           "%.1fs" % ((time.mktime(time.strptime(newest[:19], "%Y-%m-%dT%H:%M:%S"))
+                       - time.mktime(time.strptime(api[:19], "%Y-%m-%dT%H:%M:%S"))))))
 EOF
 ```
 
-Send a message and the number should drop to near zero.
+On a session you are actively using, all three should be current.
 
 ## Subagents, and why they come out right for free
 
@@ -72,8 +133,8 @@ The filesystem layout makes this self-solving:
 ~/.claude/projects/<slug>/<session_id>/tool-results/                ignored
 ```
 
-Subagent writes land in a subdirectory, so they never touch the parent file's mtime. Read
-the parent and the stall is already reflected.
+Subagent writes land in a subdirectory, so they add no record to the parent file. Read the
+parent and the stall is already reflected.
 
 
 ## Reading the TTL
@@ -146,14 +207,14 @@ can also ship a `settings.json`, but only two keys from it are honored: `agent` 
 `subagentStatusLine`.
 
 `statusLine` is not among them, so a plugin cannot install a status line. Packaging this
-as one would have added a manifest and no capability, which is why `install.py` writes to
-`~/.claude/settings.json` instead.
+as one would have added a manifest and no capability, which is why
+`claude-cache-timer install` writes to `~/.claude/settings.json` instead.
 
 ## Known inaccuracies
 
 The displayed number runs optimistic by up to one response duration. A cache TTL restarts
-when the request is sent, but the transcript is written when the response completes, so
-mtime is later than the true anchor by the length of the turn. Against an hour this is
+when the request is sent, but the record is written when the response completes, so its
+timestamp is later than the true anchor by the length of the turn. Against an hour this is
 noise. Against five minutes on a slow turn it is worth knowing.
 
 The countdown rounds up, so the display reads `0:01` through the final second rather than

@@ -1,0 +1,36 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
+name = "claude-code-cache-timer"
+description = "A Claude Code status line segment counting down the session's prompt cache"
+readme = "README.md"
+license = "GPL-3.0-or-later"
+requires-python = ">=3.8"
+dynamic = ["version"]
+dependencies = []
+keywords = ["claude", "claude-code", "statusline", "prompt-cache"]
+classifiers = [
+    "Environment :: Console",
+    "Intended Audience :: Developers",
+    "Operating System :: OS Independent",
+    "Programming Language :: Python :: 3",
+    "Topic :: Utilities",
+]
+
+[project.urls]
+Homepage = "https://github.com/GabrielAndreiPreda/claude-code-cache-timer"
+
+# The status line command in settings.json is this bare name. A name has no path
+# separators, no spaces and nothing any shell treats specially, so it runs the
+# same under Git Bash, PowerShell, cmd and sh, and the installer never has to
+# work out which of them Claude Code will use.
+[project.scripts]
+claude-cache-timer = "cache_timer.cli:main"
+
+[tool.hatch.version]
+path = "src/cache_timer/__init__.py"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/cache_timer"]

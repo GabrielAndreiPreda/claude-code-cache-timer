@@ -1,10 +1,12 @@
 #!/usr/bin/env python3
-"""Tests for the cache timer. Run with: python3 test_cache_timer.py
+"""Tests for the cache timer. Run with: python3 -m unittest discover -s tests
 
-Covers the cases real transcripts on this machine cannot supply: the 5-minute
-cache, records too large for the tail window, and the Windows quoting forms.
+Covers the cases a real transcript is unlikely to supply on demand: the 5-minute
+cache, records too large for the tail window, a session idle for days, and the
+Windows command forms.
 """
 
+import io
 import json
 import os
 import re
@@ -16,15 +18,20 @@ import time
 import unittest
 
 HERE = os.path.dirname(os.path.abspath(__file__))
-sys.path.insert(0, HERE)
+ROOT = os.path.dirname(HERE)
+# Import from the checkout rather than requiring an install, so the tests run
+# against the code in front of you.
+sys.path.insert(0, os.path.join(ROOT, "src"))
 
-import cache_timer_statusline as timer
-import install
-
-SCRIPT = os.path.join(HERE, "cache_timer_statusline.py")
+from cache_timer import cli, install
+from cache_timer import statusline as timer
 
 
-def usage_record(ttl_1h=0, ttl_5m=0, filler=0):
+def usage_record(ttl_1h=0, ttl_5m=0, filler=0, age=None):
+    """An assistant turn: the only record type an API call produces.
+
+    `age` pins the record's own timestamp instead of taking the transcript's.
+    """
     record = {
         "type": "assistant",
         "message": {
@@ -36,20 +43,51 @@ def usage_record(ttl_1h=0, ttl_5m=0, filler=0):
             }
         },
     }
+    if age is not None:
+        record["timestamp"] = iso(time.time() - age)
     if filler:
         record["padding"] = "x" * filler
     return json.dumps(record)
 
 
-def plain_record(filler=0):
-    record = {"type": "user", "message": {"role": "user", "content": "hi"}}
+def plain_record(filler=0, record_type="user", age=None):
+    """A record Claude Code writes without an API call behind it.
+
+    `age` pins the record's own timestamp instead of taking the transcript's, so
+    a test can put a local record newer than the last API response.
+    """
+    record = {"type": record_type, "message": {"role": "user", "content": "hi"}}
+    if age is not None:
+        record["timestamp"] = iso(time.time() - age)
     if filler:
         record["padding"] = "x" * filler
+    return json.dumps(record)
+
+
+def slash_command_record(age=None):
+    """What running a slash command such as `/exit` leaves in the transcript."""
+    record = {
+        "type": "user",
+        "message": {
+            "role": "user",
+            "content": "<command-name>/exit</command-name>",
+        },
+    }
+    if age is not None:
+        record["timestamp"] = iso(time.time() - age)
     return json.dumps(record)
 
 
 def strip_ansi(text):
     return re.sub(r"\033\[[0-9;]*m", "", text)
+
+
+def iso(when):
+    """A transcript timestamp for an epoch time, to the millisecond."""
+    return "%s.%03dZ" % (
+        time.strftime("%Y-%m-%dT%H:%M:%S", time.gmtime(when)),
+        (when % 1) * 1000,
+    )
 
 
 class TranscriptCase(unittest.TestCase):
@@ -58,40 +96,56 @@ class TranscriptCase(unittest.TestCase):
         self.addCleanup(shutil.rmtree, self.dir, True)
 
     def transcript(self, lines, age=0.0):
+        """Write a transcript whose records were written `age` seconds ago.
+
+        The file's mtime is left fresh on purpose. Claude Code touches
+        transcripts long after the session that wrote them stopped making calls,
+        so an aged transcript and an aged file are two different things and the
+        countdown must come from the records.
+        """
+        stamp = iso(time.time() - age)
         path = os.path.join(self.dir, "t.jsonl")
         with open(path, "w", encoding="utf-8") as handle:
             for line in lines:
+                try:
+                    record = json.loads(line)
+                    # A record that pinned its own timestamp keeps it, so a test
+                    # can age records against each other.
+                    record.setdefault("timestamp", stamp)
+                    line = json.dumps(record)
+                except ValueError:
+                    pass  # A deliberately unparseable line. Write it as it is.
                 handle.write(line + "\n")
-        if age:
-            when = time.time() - age
-            os.utime(path, (when, when))
         return path
+
+    def ttl(self, path):
+        return timer.read_transcript(path)[0]
 
 
 class TestTtlDetection(TranscriptCase):
     def test_detects_one_hour(self):
         path = self.transcript([usage_record(ttl_1h=4842)])
-        self.assertEqual(timer.find_ttl(path), 3600)
+        self.assertEqual(self.ttl(path), 3600)
 
     def test_detects_five_minutes(self):
         path = self.transcript([usage_record(ttl_5m=1900)])
-        self.assertEqual(timer.find_ttl(path), 300)
+        self.assertEqual(self.ttl(path), 300)
 
     def test_skips_pure_cache_read_turns(self):
         """A turn that only reads the cache writes {0, 0}; keep looking past it."""
         path = self.transcript(
             [usage_record(ttl_5m=1900)] + [usage_record() for _ in range(5)]
         )
-        self.assertEqual(timer.find_ttl(path), 300)
+        self.assertEqual(self.ttl(path), 300)
 
     def test_uses_most_recent_write_when_ttl_changes(self):
         """Sessions can drop from 1h to 5m; the newest write wins."""
         path = self.transcript([usage_record(ttl_1h=100), usage_record(ttl_5m=100)])
-        self.assertEqual(timer.find_ttl(path), 300)
+        self.assertEqual(self.ttl(path), 300)
 
     def test_no_cache_write_at_all(self):
         path = self.transcript([plain_record(), plain_record()])
-        self.assertIsNone(timer.find_ttl(path))
+        self.assertIsNone(self.ttl(path))
 
     def test_widens_window_past_a_giant_record(self):
         """One oversized record must not hide the cache write behind it."""
@@ -99,15 +153,107 @@ class TestTtlDetection(TranscriptCase):
             [usage_record(ttl_1h=4842), plain_record(filler=400 * 1024)]
         )
         self.assertGreater(os.path.getsize(path), timer.TAIL_WINDOW)
-        self.assertEqual(timer.find_ttl(path), 3600)
+        self.assertEqual(self.ttl(path), 3600)
 
     def test_survives_unparseable_lines(self):
         path = self.transcript(["{ this is not json", usage_record(ttl_1h=1)])
-        self.assertEqual(timer.find_ttl(path), 3600)
+        self.assertEqual(self.ttl(path), 3600)
 
     def test_empty_file(self):
         path = self.transcript([])
-        self.assertIsNone(timer.find_ttl(path))
+        self.assertIsNone(self.ttl(path))
+
+
+class TestClock(TranscriptCase):
+    """Where "now minus when" comes from."""
+
+    def test_the_clock_is_the_last_record_not_the_file(self):
+        """A touched file must not read as a live cache.
+
+        Claude Code touches old transcripts, so a long-idle session can have a
+        fresh mtime. Keyed to that, the countdown restarts from full and reports
+        cache that expired days ago.
+        """
+        path = self.transcript([usage_record(ttl_1h=1)], age=4 * 86400)
+        self.assertLess(time.time() - os.path.getmtime(path), 60)
+        self.assertIn("cold", strip_ansi(timer.render(path)))
+
+    def test_a_slash_command_does_not_reset_the_clock(self):
+        """`/exit` writes a timestamped user record and makes no API call.
+
+        Anchored on the newest timestamp of any kind, the countdown restarted on
+        a cache nothing had touched: a 5m cache that went cold 100 seconds ago
+        reported the better part of five minutes still on it.
+        """
+        path = self.transcript(
+            [
+                usage_record(ttl_5m=1900, age=400),
+                slash_command_record(age=0),
+            ]
+        )
+        self.assertIn("cold", strip_ansi(timer.render(path)))
+
+    def test_local_records_do_not_reset_the_clock(self):
+        """Every timestamped record type Claude Code writes without a request."""
+        for record_type in ("user", "attachment", "file-history-delta", "system"):
+            path = self.transcript(
+                [
+                    usage_record(ttl_5m=1900, age=400),
+                    plain_record(record_type=record_type, age=0),
+                ]
+            )
+            self.assertIn("cold", strip_ansi(timer.render(path)), record_type)
+
+    def test_the_clock_is_the_newest_api_response(self):
+        """Not the oldest one either -- a later call resets the TTL."""
+        path = self.transcript(
+            [
+                usage_record(ttl_1h=1900, age=3000),
+                usage_record(age=60),
+                slash_command_record(age=0),
+            ]
+        )
+        # Anchored on the newer response, an hour's cache has ~59 minutes left.
+        self.assertIn("59:", strip_ansi(timer.render(path)))
+
+    def test_a_transcript_of_only_local_records_is_undatable(self):
+        """No API call yet means no honest number, not a full countdown."""
+        path = self.transcript([plain_record(), slash_command_record()])
+        self.assertIn("cache ?", strip_ansi(timer.render(path)))
+
+    def test_widens_window_to_reach_the_last_api_response(self):
+        """Local records can bury the last response below the narrow window."""
+        path = self.transcript(
+            [
+                usage_record(ttl_1h=4842, age=60),
+                plain_record(filler=400 * 1024, age=0),
+            ]
+        )
+        self.assertGreater(os.path.getsize(path), timer.TAIL_WINDOW)
+        ttl, written = timer.read_transcript(path)
+        self.assertEqual(ttl, 3600)
+        self.assertIsNotNone(written)
+        self.assertAlmostEqual(time.time() - written, 60, delta=5)
+
+    def test_reads_an_iso_timestamp(self):
+        self.assertEqual(timer.epoch("1970-01-01T00:01:00.000Z"), 60)
+        self.assertEqual(timer.epoch("1970-01-01T00:01:00Z"), 60)
+
+    def test_the_millisecond_fraction_is_kept(self):
+        """Flooring it would leave the countdown up to a second pessimistic."""
+        self.assertAlmostEqual(timer.epoch("1970-01-01T00:01:00.750Z"), 60.75)
+        # An offset in place of a fraction still yields the whole second.
+        self.assertEqual(timer.epoch("1970-01-01T00:01:00+00:00"), 60)
+
+    def test_an_undatable_timestamp_is_not_a_crash(self):
+        for value in (None, "", "yesterday", 12345, "2026-13-45T99:99:99Z"):
+            self.assertIsNone(timer.epoch(value), value)
+
+    def test_records_without_timestamps_show_nothing_countable(self):
+        path = os.path.join(self.dir, "raw.jsonl")
+        with open(path, "w", encoding="utf-8") as handle:
+            handle.write(usage_record(ttl_1h=1) + "\n")
+        self.assertIn("cache ?", strip_ansi(timer.render(path)))
 
 
 class TestRender(TranscriptCase):
@@ -135,12 +281,13 @@ class TestRender(TranscriptCase):
         self.assertIn("cold", strip_ansi(timer.render(path)))
 
     def test_unknown_ttl_recently_touched(self):
-        path = self.transcript([plain_record()], age=10)
+        """A turn that only read the cache dates the call but not the bucket."""
+        path = self.transcript([usage_record()], age=10)
         self.assertIn("cache ?", strip_ansi(timer.render(path)))
 
     def test_unknown_ttl_but_older_than_any_cache(self):
         """Past the longest possible TTL it is cold whichever bucket was used."""
-        path = self.transcript([plain_record()], age=7200)
+        path = self.transcript([usage_record()], age=7200)
         self.assertIn("cold", strip_ansi(timer.render(path)))
 
     def test_hours_are_shown_when_present(self):
@@ -268,36 +415,37 @@ class TestGitBranch(unittest.TestCase):
         Skipped when there is nothing to compare against: a tarball download
         rather than a clone, or a machine with no git installed.
         """
-        if timer.find_git_dir(HERE) is None:
+        if timer.find_git_dir(ROOT) is None:
             self.skipTest("not a git checkout")
         try:
             probe = subprocess.run(
                 ["git", "rev-parse", "--abbrev-ref", "HEAD"],
-                cwd=HERE,
+                cwd=ROOT,
                 stdout=subprocess.PIPE,
                 stderr=subprocess.DEVNULL,
-                universal_newlines=True,
+                text=True,
             )
         except OSError:
             self.skipTest("git is not installed")
         if probe.returncode != 0:
             self.skipTest("git could not resolve HEAD")
-        self.assertEqual(timer.git_branch(HERE), probe.stdout.strip())
+        self.assertEqual(timer.git_branch(ROOT), probe.stdout.strip())
 
 
 class TestSubprocess(TranscriptCase):
-    """End-to-end through the real script, the way Claude Code invokes it."""
+    """End-to-end through the real entry point, the way Claude Code invokes it."""
 
     def run_script(self, payload, extra_args=(), env=None):
         environment = dict(os.environ)
+        environment["PYTHONPATH"] = os.path.join(ROOT, "src")
         if env:
             environment.update(env)
         result = subprocess.run(
-            [sys.executable, SCRIPT] + list(extra_args),
+            [sys.executable, "-m", "cache_timer"] + list(extra_args),
             input=payload,
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,
-            universal_newlines=True,
+            text=True,
             timeout=20,
             env=environment,
         )
@@ -355,111 +503,123 @@ class TestSubprocess(TranscriptCase):
         self.assertIn("59:30", strip_ansi(result.stdout))
 
 
-class TestWrapMode(TranscriptCase):
-    def setUp(self):
-        super().setUp()
-        self.wrapped_path = os.path.join(self.dir, "wrapped.json")
-        self.original = timer.WRAPPED_CONFIG
-        timer.WRAPPED_CONFIG = self.wrapped_path
-        self.addCleanup(setattr, timer, "WRAPPED_CONFIG", self.original)
+class TestCli(unittest.TestCase):
+    """Dispatch. The no-subcommand form is what settings.json invokes."""
 
-    def set_wrapped(self, command):
-        with open(self.wrapped_path, "w", encoding="utf-8") as handle:
-            json.dump({"type": "command", "command": command}, handle)
+    def run_cli(self, argv, stdin=None):
+        """Run the entry point with its streams captured."""
+        saved = sys.stdout, sys.stderr, sys.stdin
+        sys.stdout, sys.stderr = io.StringIO(), io.StringIO()
+        if stdin is not None:
+            sys.stdin = stdin
+        try:
+            code = cli.main(argv)
+            return code, sys.stdout.getvalue() + sys.stderr.getvalue()
+        finally:
+            sys.stdout, sys.stderr, sys.stdin = saved
 
-    def test_appends_to_the_wrapped_output(self):
-        self.set_wrapped("echo hello")
-        self.assertEqual(timer.load_wrapped(), "echo hello")
-        self.assertEqual(timer.combine("hello", "SEG"), "hello  SEG")
+    def test_version(self):
+        code, out = self.run_cli(["--version"])
+        self.assertEqual(code, 0)
+        self.assertIn("claude-cache-timer", out)
 
-    def test_appends_to_the_last_line_only(self):
-        self.assertEqual(timer.combine("one\ntwo", "SEG"), "one\ntwo  SEG")
+    def test_help(self):
+        code, out = self.run_cli(["--help"])
+        self.assertEqual(code, 0)
+        self.assertIn("usage:", out)
 
-    def test_segment_alone_when_wrapped_command_fails(self):
-        self.assertEqual(timer.combine(None, "SEG"), "SEG")
+    def test_unknown_argument_is_rejected(self):
+        code, out = self.run_cli(["--nope"])
+        self.assertEqual(code, 2)
+        self.assertIn("--nope", out)
 
-    def test_wrapped_output_alone_when_segment_fails(self):
-        self.assertEqual(timer.combine("hello", None), "hello")
+    def test_help_is_shown_when_run_interactively(self):
+        """A bare invocation at a prompt must not hang on a read of stdin."""
+        terminal = io.StringIO()
+        terminal.isatty = lambda: True
+        code, out = self.run_cli([], stdin=terminal)
+        self.assertEqual(code, 0)
+        self.assertIn("usage:", out)
 
-    def test_failing_command_yields_nothing(self):
-        self.assertIsNone(timer.run_wrapped("exit 1", "{}"))
-
-    def test_wrapped_output_suppresses_our_context(self):
-        """The wrapped command draws the row, so it shows its own context."""
-        out = strip_ansi(timer.compose("theirs", "SEG", "CTX"))
-        self.assertEqual(out, "theirs  SEG")
-
-    def test_context_is_drawn_when_no_wrapped_output(self):
-        """Covers both no wrap configured and a wrap that produced nothing."""
-        self.assertEqual(strip_ansi(timer.compose(None, "SEG", "CTX")), "CTX  SEG")
-
-    def test_wrapped_command_receives_the_payload(self):
-        # Echoes stdin via this interpreter rather than `cat`, which does not
-        # exist under cmd.exe on Windows.
-        script = os.path.join(self.dir, "echo_payload.py")
-        with open(script, "w", encoding="utf-8") as handle:
-            handle.write("import sys; sys.stdout.write(sys.stdin.read())\n")
-        payload = json.dumps({"transcript_path": "/x", "session_id": "abc"})
-        out = timer.run_wrapped('"%s" "%s"' % (sys.executable, script), payload)
-        self.assertIn("abc", out)
+    def test_a_piped_payload_is_rendered(self):
+        code, out = self.run_cli([], stdin=io.StringIO("{}"))
+        self.assertEqual(code, 0)
+        self.assertEqual(out, "")
 
 
-class TestCommandBuilder(unittest.TestCase):
-    """The three quoting forms. Getting these wrong fails silently."""
+class FakeShutil:
+    """Stands in for the shutil install.py uses, so PATH can be controlled."""
 
-    def test_unix_form(self):
-        command = install.build_command(
-            ["/usr/bin/python3"], "/home/a/s.py", powershell=False
-        )
-        self.assertEqual(command, '"/usr/bin/python3" "/home/a/s.py"')
+    def __init__(self, which):
+        self._which = which
 
-    def test_windows_git_bash_form(self):
-        command = install.build_command(
-            ["C:\\Python\\python.exe"],
-            "C:\\Users\\Ada Byron\\s.py",
-            powershell=False,
-        )
-        self.assertEqual(
-            command, '"C:/Python/python.exe" "C:/Users/Ada Byron/s.py"'
-        )
-        self.assertNotIn("\\", command)
+    def which(self, name):
+        return self._which.get(name)
 
-    def test_windows_powershell_form_uses_the_call_operator(self):
-        command = install.build_command(
-            ["C:\\Python\\python.exe"],
-            "C:\\Users\\Ada Byron\\s.py",
-            powershell=True,
-        )
-        self.assertTrue(command.startswith("& "), command)
-        self.assertNotIn("\\", command)
+    def __getattr__(self, name):
+        return getattr(shutil, name)
 
-    def test_py_launcher_needs_no_call_operator(self):
-        """A bare command name runs fine in PowerShell unquoted."""
-        command = install.build_command(
-            ["py", "-3"], "C:/Users/a/s.py", powershell=True
-        )
-        self.assertFalse(command.startswith("&"), command)
-        self.assertEqual(command, 'py -3 "C:/Users/a/s.py"')
+
+class TestCandidate(unittest.TestCase):
+    """What ends up in settings.json, and what happens when it cannot."""
+
+    def patch(self, name, value):
+        original = getattr(install, name)
+        setattr(install, name, value)
+        self.addCleanup(setattr, install, name, original)
+
+    def test_bare_name_when_the_console_script_is_on_path(self):
+        """No path, no quoting, so no shell can mangle it."""
+        self.patch("shutil", FakeShutil(which={install.CONSOLE_SCRIPT: "/usr/bin/cct"}))
+        chosen = install.candidate()
+        self.assertEqual(chosen.command(), install.CONSOLE_SCRIPT)
+        # settings.json gets the bare name; verification runs the resolved path.
+        self.assertEqual(chosen.argv[0], "/usr/bin/cct")
 
     def test_ascii_flag_is_appended(self):
-        command = install.build_command(
-            ["/usr/bin/python3"], "/home/a/s.py", ascii_only=True
-        )
-        self.assertTrue(command.endswith(" --ascii"), command)
+        self.patch("shutil", FakeShutil(which={install.CONSOLE_SCRIPT: "/usr/bin/cct"}))
+        chosen = install.candidate(ascii_only=True)
+        self.assertEqual(chosen.command(), install.CONSOLE_SCRIPT + " --ascii")
 
-    def test_paths_never_contain_backslashes(self):
-        """Git Bash eats unquoted backslashes and fails with no visible error."""
-        for powershell in (True, False):
-            command = install.build_command(
-                ["C:\\P\\python.exe"], "C:\\U\\s.py", powershell=powershell
-            )
-            self.assertNotIn("\\", command)
+    def test_nothing_is_installable_when_the_script_is_not_on_path(self):
+        """Rather than write an absolute path that a shell would have to quote."""
+        self.patch("shutil", FakeShutil(which={}))
+        self.assertIsNone(install.candidate())
+
+    def test_a_missing_script_is_a_hard_stop_with_the_fix(self):
+        self.patch("shutil", FakeShutil(which={}))
+        with self.assertRaises(SystemExit) as caught:
+            install.choose()
+        message = str(caught.exception)
+        self.assertIn("not on PATH", message)
+        self.assertIn("update-shell", message)
+        self.assertIn("ensurepath", message)
+        self.assertIn("Nothing was written", message)
 
 
 class TestInstallerVerification(unittest.TestCase):
+    def module_candidate(self):
+        # Not a form the installer ever writes, but verify() only needs an argv,
+        # and this is the handiest one that renders a real countdown.
+        return install.Candidate(
+            [sys.executable, "-m", "cache_timer"],
+            [sys.executable, "-m", "cache_timer"],
+        )
+
+    def setUp(self):
+        # `python -m cache_timer` only resolves from an install or a path entry.
+        self.environ = os.environ.get("PYTHONPATH")
+        os.environ["PYTHONPATH"] = os.path.join(ROOT, "src")
+        self.addCleanup(self.restore)
+
+    def restore(self):
+        if self.environ is None:
+            os.environ.pop("PYTHONPATH", None)
+        else:
+            os.environ["PYTHONPATH"] = self.environ
+
     def test_verify_accepts_the_real_command(self):
-        command = install.build_command([sys.executable], SCRIPT)
-        ok, detail = install.verify(command)
+        ok, detail = install.verify(self.module_candidate())
         self.assertTrue(ok, detail)
         # The fixture is written with a fresh mtime, so the full hour is left.
         self.assertIn("1:00:00", strip_ansi(detail))
@@ -468,29 +628,27 @@ class TestInstallerVerification(unittest.TestCase):
         self.assertIn("Opus", strip_ansi(detail))
 
     def test_verify_rejects_a_silent_command(self):
-        ok, _ = install.verify("true")
+        ok, _ = install.verify(install.Candidate(["true"], ["true"]))
         self.assertFalse(ok)
 
     def test_verify_rejects_a_broken_command(self):
-        ok, _ = install.verify("this-command-does-not-exist-xyz")
+        name = "this-command-does-not-exist-xyz"
+        ok, _ = install.verify(install.Candidate([name], [name]))
         self.assertFalse(ok)
 
 
-class TestSettingsRoundTrip(unittest.TestCase):
-    """Install and uninstall against a throwaway settings.json."""
+class SettingsCase(unittest.TestCase):
+    """A throwaway settings.json, so no test can touch the real one."""
 
     def setUp(self):
         self.dir = tempfile.mkdtemp(prefix="cache-timer-settings-")
         self.addCleanup(shutil.rmtree, self.dir, True)
         self.settings = os.path.join(self.dir, "settings.json")
-        self.wrapped = os.path.join(self.dir, "wrapped.json")
         self.patched = {
             "SETTINGS": install.SETTINGS,
-            "WRAPPED": install.WRAPPED,
             "BACKUP_DIR": install.BACKUP_DIR,
         }
         install.SETTINGS = self.settings
-        install.WRAPPED = self.wrapped
         install.BACKUP_DIR = os.path.join(self.dir, "backups")
         self.addCleanup(self.restore)
 
@@ -505,6 +663,10 @@ class TestSettingsRoundTrip(unittest.TestCase):
     def read(self):
         with open(self.settings, "r", encoding="utf-8") as handle:
             return json.load(handle)
+
+
+class TestSettingsRoundTrip(SettingsCase):
+    """Reading and rewriting settings.json without losing anything."""
 
     def test_preserves_unrelated_settings(self):
         self.write({"model": "opus", "hooks": {"Stop": [{"matcher": ""}]}})
@@ -573,6 +735,90 @@ class TestSettingsRoundTrip(unittest.TestCase):
             pass
         with open(self.settings, "r", encoding="utf-8") as handle:
             self.assertEqual(handle.read(), original)
+
+
+class TestInstallCommand(SettingsCase):
+    """install() and uninstall() end to end, with verification stubbed out."""
+
+    def setUp(self):
+        super().setUp()
+        fake = install.Candidate([install.CONSOLE_SCRIPT], ["/usr/bin/cct"])
+        self.patched_choose = install.choose
+        install.choose = lambda ascii_only=False: (fake, "rendered")
+        self.addCleanup(setattr, install, "choose", self.patched_choose)
+
+    def run_command(self, function, argv):
+        """Run a command with stdout captured; returns (exit code, output)."""
+        stdout, sys.stdout = sys.stdout, io.StringIO()
+        try:
+            code = function(argv)
+            return code, sys.stdout.getvalue()
+        finally:
+            sys.stdout = stdout
+
+    def status_line(self):
+        return self.read().get("statusLine")
+
+    def test_writes_the_bare_command(self):
+        code, _ = self.run_command(install.install, [])
+        self.assertEqual(code, 0)
+        self.assertEqual(
+            self.status_line(),
+            {
+                "type": "command",
+                "command": install.CONSOLE_SCRIPT,
+                "refreshInterval": 1,
+            },
+        )
+
+    def test_dry_run_writes_nothing(self):
+        self.write({"model": "opus"})
+        self.run_command(install.install, ["--dry-run"])
+        self.assertIsNone(self.status_line())
+
+    def test_a_foreign_status_line_is_refused_without_force(self):
+        """Silently discarding somebody's status line is worse than a flag."""
+        self.write({"statusLine": {"type": "command", "command": "my-own-thing"}})
+        with self.assertRaises(SystemExit):
+            self.run_command(install.install, [])
+        self.assertEqual(self.status_line()["command"], "my-own-thing")
+
+    def test_force_replaces_a_foreign_status_line(self):
+        self.write({"statusLine": {"type": "command", "command": "my-own-thing"}})
+        self.run_command(install.install, ["--force"])
+        self.assertEqual(self.status_line()["command"], install.CONSOLE_SCRIPT)
+
+    def test_reinstalling_over_our_own_needs_no_force(self):
+        self.write({"statusLine": {"type": "command", "command": "claude-cache-timer"}})
+        code, _ = self.run_command(install.install, ["--interval", "3"])
+        self.assertEqual(code, 0)
+        self.assertEqual(self.status_line()["refreshInterval"], 3)
+
+    def test_the_full_path_form_is_recognised_as_ours(self):
+        """A PATH-less install writes a path, and reinstalling must know it."""
+        old = '"/home/ada/.local/bin/claude-cache-timer" --ascii'
+        self.assertTrue(install.is_ours(old))
+        self.write({"statusLine": {"type": "command", "command": old}})
+        code, _ = self.run_command(install.install, [])
+        self.assertEqual(code, 0)
+        self.assertEqual(self.status_line()["command"], install.CONSOLE_SCRIPT)
+
+    def test_padding_is_carried_over(self):
+        self.write({"statusLine": {"command": "claude-cache-timer", "padding": 0}})
+        self.run_command(install.install, [])
+        self.assertEqual(self.status_line()["padding"], 0)
+
+    def test_uninstall_removes_the_entry(self):
+        self.write({"model": "opus", "statusLine": {"command": "claude-cache-timer"}})
+        code, _ = self.run_command(install.uninstall, [])
+        self.assertEqual(code, 0)
+        self.assertIsNone(self.status_line())
+        self.assertEqual(self.read()["model"], "opus")
+
+    def test_uninstall_leaves_a_foreign_status_line_alone(self):
+        self.write({"statusLine": {"command": "my-own-thing"}})
+        self.run_command(install.uninstall, [])
+        self.assertEqual(self.status_line()["command"], "my-own-thing")
 
 
 if __name__ == "__main__":

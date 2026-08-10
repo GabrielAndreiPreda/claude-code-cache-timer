@@ -1,15 +1,22 @@
-#!/usr/bin/env python3
 """Claude Code status line segment showing time left on the session's prompt cache.
 
 Reads the status line JSON payload on stdin, finds the session transcript, and
 prints how long the prompt cache has before it expires. Configuring a status line
-replaces Claude Code's built-in one, so the model name is redrawn here too unless
-a wrapped command is already drawing the row.
+replaces Claude Code's built-in one, so the model name is redrawn here too.
 
-The clock is the transcript's mtime: Claude Code appends to the file on every
-message, so it advances on every API call the parent session makes. Subagents write
-to a ``subagents/`` subdirectory instead, so the parent mtime correctly stalls while
-a subagent runs. The cache really is draining during that time.
+The clock is the timestamp on the last assistant turn carrying a ``usage`` block,
+because only an API call produces one. It is deliberately not the last record in the
+file: most of what a transcript logs is local, and much of that is timestamped, so a
+clock keyed to the newest record of any kind restarts on events that cost nothing.
+Running a slash command such as ``/exit`` is the clearest case -- it appends a
+timestamped record and sends no request. Subagents write to a ``subagents/``
+subdirectory, so the parent's clock correctly stalls while a subagent runs. The cache
+really is draining during that time.
+
+The file's own mtime is wrong for the same reason, only more so. Claude Code touches
+transcripts long after a session's last API call, and a countdown keyed to mtime
+restarts from full every time it does, so a session that has been idle for days can
+report most of an hour still on the clock.
 
 The TTL is read from the transcript rather than assumed. Sessions run on either the
 5-minute or the 1-hour cache, and can move between them, so a hardcoded value is
@@ -19,11 +26,10 @@ Nothing here may raise or write to stderr. This runs once a second and a crash
 blanks the status line row.
 """
 
-import io
+import calendar
 import json
 import math
 import os
-import subprocess
 import sys
 import time
 
@@ -44,11 +50,6 @@ TTL_5M = 300
 TAIL_WINDOW = 256 * 1024
 TAIL_WINDOW_WIDE = 2 * 1024 * 1024
 
-WRAPPED_CONFIG = os.path.join(
-    os.path.expanduser("~"), ".claude", "cache-timer", "wrapped.json"
-)
-WRAPPED_TIMEOUT = 2.0
-
 
 def _force_utf8_stdout():
     """Make stdout UTF-8 so the glyphs survive.
@@ -58,14 +59,6 @@ def _force_utf8_stdout():
     """
     try:
         sys.stdout.reconfigure(encoding="utf-8", errors="replace")
-    except AttributeError:
-        # Python 3.6 and earlier have no reconfigure(). Rewrap the buffer.
-        try:
-            sys.stdout = io.TextIOWrapper(
-                sys.stdout.buffer, encoding="utf-8", errors="replace"
-            )
-        except Exception:
-            pass
     except Exception:
         pass
 
@@ -89,48 +82,113 @@ def read_tail(path, size, window):
     return [line for line in data.split(b"\n") if line.strip()]
 
 
-def ttl_from_lines(lines):
-    """Find the TTL of the most recent cache write, or None.
+def is_api_response(record):
+    """Whether a record is proof that an API call happened.
 
-    Walks backwards for the newest ``cache_creation`` with a non-zero bucket. A
-    turn that only reads the cache records ``{0, 0}``, so skip those rather than
-    treating them as an answer.
+    Only assistant turns carry a ``usage`` block and only a response from the API
+    produces one, which makes it the one reliable marker in the file. Everything
+    else is written locally and must not set the clock, however recent its
+    timestamp looks.
+
+    An allowlist on purpose. A record type added to Claude Code later is ignored
+    rather than becoming a new way to reset the countdown, and a marker missed
+    here understates the cache rather than overstating it.
     """
+    if record.get("type") != "assistant":
+        return False
+    message = record.get("message")
+    if not isinstance(message, dict):
+        return False
+    return isinstance(message.get("usage"), dict)
+
+
+def ttl_from_record(record):
+    """The cache TTL a record's usage implies, or None.
+
+    A turn that only reads the cache records ``{0, 0}``, which says nothing about
+    the bucket, so those have to read as no answer rather than as an answer.
+    """
+    message = record.get("message")
+    if not isinstance(message, dict):
+        return None
+    usage = message.get("usage")
+    if not isinstance(usage, dict):
+        return None
+    created = usage.get("cache_creation")
+    if not isinstance(created, dict):
+        return None
+    if created.get("ephemeral_1h_input_tokens"):
+        return TTL_1H
+    if created.get("ephemeral_5m_input_tokens"):
+        return TTL_5M
+    return None
+
+
+def epoch(stamp):
+    """Seconds since the epoch for a transcript timestamp, or None.
+
+    Every record carries one as an ISO 8601 string in UTC, to the millisecond:
+    ``2025-01-31T09:15:42.318Z``. The fraction is kept. Dropping it would floor
+    the anchor and leave the countdown up to a second pessimistic, which is
+    visible on a display that ticks once a second.
+    """
+    if not isinstance(stamp, str):
+        return None
+    try:
+        seconds = calendar.timegm(time.strptime(stamp[:19], "%Y-%m-%dT%H:%M:%S"))
+    except Exception:
+        return None
+    fraction = stamp[19:].rstrip("Z")
+    if not fraction:
+        return seconds
+    try:
+        return seconds + float(fraction)
+    except ValueError:
+        # An offset such as +00:00 rather than a fraction. The whole second is
+        # close enough to carry on with.
+        return seconds
+
+
+def scan(lines):
+    """The cache TTL and the time of the last API call, from a transcript tail.
+
+    One backwards walk for both, since the answers are usually a line or two
+    apart and this runs once a second. Either may be None.
+
+    Records that are not API responses are skipped outright rather than being
+    allowed to set the clock; see `is_api_response`.
+    """
+    ttl = None
+    written = None
     for line in reversed(lines):
         try:
             record = json.loads(line)
         except Exception:
             continue
-        if not isinstance(record, dict):
+        if not isinstance(record, dict) or not is_api_response(record):
             continue
-        message = record.get("message")
-        if not isinstance(message, dict):
-            continue
-        usage = message.get("usage")
-        if not isinstance(usage, dict):
-            continue
-        created = usage.get("cache_creation")
-        if not isinstance(created, dict):
-            continue
-        if created.get("ephemeral_1h_input_tokens"):
-            return TTL_1H
-        if created.get("ephemeral_5m_input_tokens"):
-            return TTL_5M
-    return None
+        if written is None:
+            written = epoch(record.get("timestamp"))
+        if ttl is None:
+            ttl = ttl_from_record(record)
+        if ttl is not None and written is not None:
+            break
+    return ttl, written
 
 
-def find_ttl(path, size=None):
-    """Read the transcript tail and determine the cache TTL in seconds."""
+def read_transcript(path, size=None):
+    """Scan the transcript tail for the TTL and the time of the last record."""
     if size is None:
         size = os.path.getsize(path)
-    ttl = ttl_from_lines(read_tail(path, size, TAIL_WINDOW))
-    if ttl is not None:
-        return ttl
-    # The window may have landed inside one enormous record. Try once more with a
-    # wider one before giving up.
-    if size > TAIL_WINDOW:
-        ttl = ttl_from_lines(read_tail(path, size, TAIL_WINDOW_WIDE))
-    return ttl
+    ttl, written = scan(read_tail(path, size, TAIL_WINDOW))
+    # The window may have landed inside one enormous record, or behind a long run
+    # of local records with the last API response above it. Either leaves an
+    # answer missing, so try once more with a wider window before giving up.
+    if (ttl is None or written is None) and size > TAIL_WINDOW:
+        wider_ttl, wider_written = scan(read_tail(path, size, TAIL_WINDOW_WIDE))
+        ttl = ttl if ttl is not None else wider_ttl
+        written = written if written is not None else wider_written
+    return ttl, written
 
 
 def format_clock(seconds):
@@ -155,19 +213,25 @@ def render(path, ascii_only=False):
     separator = "-" if ascii_only else "·"
 
     # A payload that is missing the key, or carries a non-string, is not an
-    # error worth reporting. Note that os.stat() accepts an integer as a file
+    # error worth reporting. Note that stat accepts an integer as a file
     # descriptor, so an unchecked number here would stat something unrelated.
     if not path or not isinstance(path, str):
         return None
     # Resolved fresh every tick: the transcript does not exist yet at session
     # start, and compaction replaces it.
     try:
-        info = os.stat(path)
+        size = os.path.getsize(path)
     except OSError:
         return None
-    age = time.time() - info.st_mtime
 
-    ttl = find_ttl(path, info.st_size)
+    ttl, written = read_transcript(path, size)
+    if written is None:
+        # No datable API response in the tail. A session that has not made its
+        # first call yet is the usual reason, along with an empty or truncated
+        # transcript, and there is no honest number to show for either.
+        return "%scache ?%s" % (DIM, RESET)
+    age = time.time() - written
+
     if ttl is None:
         # No cache write on record. If the transcript is older than the longest
         # TTL there is, it is cold whichever bucket it used.
@@ -261,8 +325,7 @@ def render_context(payload, ascii_only=False):
     """Redraw model, directory and branch, or None if the payload has neither.
 
     A configured status line replaces Claude Code's built-in one entirely, so
-    everything it used to show is gone unless this draws it. Only used when
-    nothing else is drawing the row.
+    everything it used to show is gone unless this draws it.
     """
     if not isinstance(payload, dict):
         return None
@@ -297,65 +360,11 @@ def prefix_context(context, segment):
     return "%s  %s" % (context, segment) if segment else context
 
 
-def load_wrapped():
-    """Return the status line command we displaced at install time, if any."""
-    try:
-        with open(WRAPPED_CONFIG, "r", encoding="utf-8") as handle:
-            config = json.load(handle)
-    except Exception:
-        return None
-    if isinstance(config, dict):
-        command = config.get("command")
-        if isinstance(command, str) and command.strip():
-            return command
-    return None
-
-
-def run_wrapped(command, payload_text):
-    """Run the displaced status line command, feeding it the same payload."""
-    try:
-        result = subprocess.run(
-            command,
-            shell=True,
-            input=payload_text,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.DEVNULL,
-            timeout=WRAPPED_TIMEOUT,
-            universal_newlines=True,
-        )
-    except Exception:
-        return None
-    if result.returncode != 0:
-        return None
-    output = (result.stdout or "").rstrip("\n")
-    return output if output.strip() else None
-
-
-def combine(inner, segment):
-    """Append our segment to the last line of the wrapped command's output."""
-    if inner is None:
-        return segment
-    if segment is None:
-        return inner
-    lines = inner.split("\n")
-    lines[-1] = "%s  %s" % (lines[-1], segment)
-    return "\n".join(lines)
-
-
-def compose(inner, segment, context):
-    """Build the final row from the wrapped output, our segment, and the context.
-
-    The context is drawn only when the wrapped command is absent or produced
-    nothing, since a status line that draws this row already shows its own.
-    """
-    if inner is None:
-        return prefix_context(context, segment)
-    return combine(inner, segment)
-
-
-def main():
+def main(argv=None):
+    """Render one status line row from the payload on stdin."""
     _force_utf8_stdout()
-    ascii_only = "--ascii" in sys.argv[1:]
+    argv = sys.argv[1:] if argv is None else argv
+    ascii_only = "--ascii" in argv
 
     try:
         payload_text = sys.stdin.read()
@@ -379,24 +388,10 @@ def main():
     except Exception:
         context = None
 
-    inner = None
-    wrapped = load_wrapped()
-    if wrapped:
-        inner = run_wrapped(wrapped, payload_text)
-
-    output = compose(inner, segment, context)
+    output = prefix_context(context, segment)
     if output:
         try:
             sys.stdout.write(output + "\n")
         except Exception:
             pass
     return 0
-
-
-if __name__ == "__main__":
-    try:
-        sys.exit(main())
-    except Exception:
-        # Last line of defence. A traceback on stderr every second would be worse
-        # than showing nothing.
-        sys.exit(0)

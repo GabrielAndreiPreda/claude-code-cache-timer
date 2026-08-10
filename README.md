@@ -30,16 +30,31 @@ rather than a directory, are followed; a detached HEAD shows a short SHA.
 
 ## Install
 
-Requires Python 3.8 or newer. Linux, macOS, and Windows.
+Requires Python 3.8 or newer. Linux, macOS, and Windows. No dependencies.
 
 ```sh
-git clone https://github.com/GabrielAndreiPreda/claude-code-cache-timer
-cd claude-code-cache-timer
-python3 install.py
+uv tool install git+https://github.com/GabrielAndreiPreda/claude-code-cache-timer
+# or: pipx install git+https://github.com/GabrielAndreiPreda/claude-code-cache-timer
+
+claude-cache-timer install
 ```
 
 Then open a new Claude Code session. To preview without writing anything, use
 `--dry-run`.
+
+If the shell cannot find `claude-cache-timer` after the first command, run `uv tool
+update-shell` (or `pipx ensurepath`) and open a new terminal before the second. The
+installer needs the name on PATH and stops with that same advice if it is missing,
+without touching `settings.json`.
+
+The status line command it writes is just that name. A name has no path separators, no
+spaces and nothing any shell treats specially, so it runs the same whether Claude Code
+routes the status line through Git Bash, PowerShell or `sh`, and none of them has to be
+identified first. That is why the installer insists on the name rather than falling back
+to an absolute path, which would have to be quoted for a shell it cannot inspect.
+
+WSL and Windows are separate environments with separate home directories, so a Claude Code
+you run in each needs its own install.
 
 The installer adds a `statusLine` entry to `~/.claude/settings.json` and copies the old
 file into `~/.claude/backups/` first. It changes nothing else and leaves your hooks and
@@ -50,10 +65,8 @@ parser rejects. If your file has either, the installer stops without touching it
 prints the block to paste in yourself, rather than rewriting the file and stripping your
 comments.
 
-If you already have a status line, the installer keeps it and wraps it. Your command
-still runs and still gets the same JSON payload, and the cache segment is appended to its
-last line. The original goes to `~/.claude/cache-timer/wrapped.json`, and uninstall puts
-it back.
+Only one status line can be active at a time. If you already have one, the installer stops
+and shows it rather than discarding it; pass `--force` to replace it.
 
 Options:
 
@@ -62,9 +75,11 @@ Options:
 | `--ascii` | use `~` and `*` instead of emoji, for terminals that render them badly |
 | `--interval N` | seconds between refreshes (default 1) |
 | `--dry-run` | verify and print the change without writing |
+| `--force` | replace an existing status line that is not this one |
 
 ```sh
-python3 uninstall.py
+claude-cache-timer uninstall
+uv tool uninstall claude-code-cache-timer   # or: pipx uninstall ...
 ```
 
 ## How it works
@@ -76,13 +91,21 @@ the cache resets the TTL.
 remaining = ttl - (now - last_api_call)
 ```
 
-The clock is the transcript's mtime. `~/.claude/projects/<slug>/<session_id>.jsonl` gets
-appended on every message, so its mtime advances on every API call the session makes,
-including the many that no hook reports.
+The clock is the timestamp on the last assistant turn in the transcript
+`~/.claude/projects/<slug>/<session_id>.jsonl`. Only assistant turns carry a `usage`
+block and only a response from the API produces one, so that timestamp advances on every
+call the session makes, including the many that no hook reports.
+
+It deliberately is not the last *record*. Most of what a transcript logs is local, and
+much of it is timestamped, so a clock keyed to the newest record of any kind restarts on
+things that cost nothing: run `/exit` or `/clear` and the countdown jumps back to full
+on a cache that is still draining. The file's own mtime is wrong the same way, and
+worse — Claude Code touches transcripts long after a session's last call, so an idle
+session reports most of an hour left on a cache that went cold days ago.
 
 Subagents come out right for free. They write to a `subagents/` subdirectory, and their
-calls do not refresh the parent's cache. So while a subagent runs, the parent transcript's
-mtime stalls and the countdown keeps draining, which is what you want to see. "The agent
+calls do not refresh the parent's cache. So while a subagent runs, the parent transcript
+stalls and the countdown keeps draining, which is what you want to see. "The agent
 is busy, so the cache must be fine" is wrong: a long-running subagent, a long build, or a
 permission prompt you walked away from all drain the cache while the session looks like
 it's working.
@@ -99,9 +122,9 @@ walks the transcript tail backwards for the newest non-zero bucket, re-reading e
 Turns that only read the cache record `{0, 0}`, so those get skipped rather than mistaken
 for an answer.
 
-There are no hooks, and no state file unless you are wrapping an existing status line.
-Everything needed arrives in the status line's own stdin payload (`transcript_path`,
-`model.display_name`, `workspace.current_dir`), once a second via `refreshInterval`.
+There are no hooks and no state file. Everything needed arrives in the status line's own
+stdin payload (`transcript_path`, `model.display_name`, `workspace.current_dir`), once a
+second via `refreshInterval`.
 [CACHE-MECHANISM.md](CACHE-MECHANISM.md) documents all of this in full.
 
 ## Limitations
@@ -121,27 +144,25 @@ about 12 ms is Python interpreter startup that no amount of tuning inside the sc
 recover; several times more on Windows, where process creation and Python startup are both
 slower. Raise `refreshInterval` to `2` in `settings.json` if you would rather.
 
-Wrapped commands run under `/bin/sh` on Unix and `cmd.exe` on Windows, which may not be
-the shell yours was written for. Wrapping a Git Bash status line on Windows can need the
-command adjusted by hand.
-
 The status line also requires that you have accepted the workspace trust dialog, the same
 gate that applies to hooks.
 
 ## Tests
 
 ```sh
-python3 test_cache_timer.py
+python3 -m unittest discover -s tests
 ```
 
-63 tests covering TTL detection (both buckets, mid-session changes, records too large for
-the tail window), the colour bands, graceful degradation on every malformed input, branch
-reading (worktrees, submodules, detached HEAD), wrap mode, and the three Windows and Unix
-command-quoting forms.
+77 tests covering TTL detection (both buckets, mid-session changes, records too large for
+the tail window), the clock (including a transcript touched long after its last call, and
+the local records that must not reset it), the colour bands, graceful degradation on
+every malformed input, branch
+reading (worktrees, submodules, detached HEAD), the install and uninstall round trip, and
+the command forms.
 
-Windows quoting is unit-tested. The installer executes the command it generates before writing
-anything, so a quoting mistake fails loudly at install time instead of leaving you a
-silently blank status line.
+Whichever form it settles on, the installer runs it against a synthetic payload before
+writing anything, so a broken command fails loudly at install time instead of leaving you
+a silently blank status line.
 
 ## License
 
