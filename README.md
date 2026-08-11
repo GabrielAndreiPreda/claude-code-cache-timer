@@ -3,9 +3,9 @@
 A Claude Code status line segment that counts down the time left on your session's
 prompt cache.
 
-```
-Opus · ~/my-project · main    ⏳ 52:18 · 1h
-```
+
+![Status line display](image.png)
+
 
 When the cache lapses, the next turn re-writes the entire prompt prefix at 1.25x
 (5-minute cache) or 2x (1-hour cache) the base input rate. Nothing in the UI tells you
@@ -15,7 +15,7 @@ how much time is left, so you can't tell whether to keep typing now or go make c
 |---|---|
 | `⏳ 52:18 · 1h` green | over half the TTL remains |
 | `⏳ 21:04 · 1h` yellow | between a fifth and a half |
-| `⏳ 3:41 · 5m` red | under a fifth, spend it or lose it |
+| `⏳ 3:41 · 1h` red | under a fifth, spend it or lose it |
 | `❄️ cold` | expired; the next turn pays to rewrite the prefix |
 | `cache ?` | no cache write on record yet, TTL unknown |
 
