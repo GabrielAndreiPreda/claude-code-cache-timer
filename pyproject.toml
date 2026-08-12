@@ -10,17 +10,30 @@ license = "GPL-3.0-or-later"
 requires-python = ">=3.8"
 dynamic = ["version"]
 dependencies = []
+authors = [{ name = "Gabriel Preda" }]
 keywords = ["claude", "claude-code", "statusline", "prompt-cache"]
+# No "License ::" classifier: `license` above is an SPDX expression, and PEP 639
+# says a project uses one form or the other, never both.
 classifiers = [
+    "Development Status :: 5 - Production/Stable",
     "Environment :: Console",
     "Intended Audience :: Developers",
     "Operating System :: OS Independent",
     "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.8",
+    "Programming Language :: Python :: 3.9",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Programming Language :: Python :: 3.13",
     "Topic :: Utilities",
 ]
 
 [project.urls]
 Homepage = "https://github.com/GabrielAndreiPreda/claude-code-cache-timer"
+Source = "https://github.com/GabrielAndreiPreda/claude-code-cache-timer"
+Issues = "https://github.com/GabrielAndreiPreda/claude-code-cache-timer/issues"
+Changelog = "https://github.com/GabrielAndreiPreda/claude-code-cache-timer/blob/main/CHANGELOG.md"
 
 # The status line command in settings.json is this bare name. A name has no path
 # separators, no spaces and nothing any shell treats specially, so it runs the
