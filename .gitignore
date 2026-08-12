@@ -7,3 +7,6 @@ venv/
 build/
 dist/
 *.egg-info/
+
+# Per-machine Claude Code permissions. A shared .claude/settings.json stays trackable.
+.claude/settings.local.json
