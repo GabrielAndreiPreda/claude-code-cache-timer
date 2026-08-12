@@ -432,7 +432,24 @@ class TestGitBranch(unittest.TestCase):
             self.skipTest("git is not installed")
         if probe.returncode != 0:
             self.skipTest("git could not resolve HEAD")
-        self.assertEqual(timer.git_branch(ROOT), probe.stdout.strip())
+        expected = probe.stdout.strip()
+        if expected == "HEAD":
+            # A detached HEAD, which is how CI checks out a pull request.
+            # `--abbrev-ref` answers the literal string "HEAD" there, while
+            # git_branch reports the short SHA, so resolve the SHA to compare
+            # against.
+            resolved = subprocess.run(
+                ["git", "rev-parse", "HEAD"],
+                cwd=ROOT,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.DEVNULL,
+                encoding="utf-8",
+                errors="replace",
+            )
+            if resolved.returncode != 0:
+                self.skipTest("git could not resolve HEAD")
+            expected = resolved.stdout.strip()[:7]
+        self.assertEqual(timer.git_branch(ROOT), expected)
 
 
 class TestSubprocess(TranscriptCase):
@@ -581,7 +598,9 @@ class TestCandidate(unittest.TestCase):
         chosen = install.candidate()
         self.assertEqual(chosen.command(), install.CONSOLE_SCRIPT)
         # settings.json gets the bare name; verification runs the resolved path.
-        self.assertEqual(chosen.argv[0], "/usr/bin/cct")
+        # Through abspath, because that is what `candidate` applies, and on
+        # Windows it rewrites this POSIX path to C:\usr\bin\cct.
+        self.assertEqual(chosen.argv[0], os.path.abspath("/usr/bin/cct"))
 
     def test_ascii_flag_is_appended(self):
         self.patch("shutil", FakeShutil(which={install.CONSOLE_SCRIPT: "/usr/bin/cct"}))
@@ -645,6 +664,10 @@ class TestInstallerVerification(unittest.TestCase):
 
         Run in a child interpreter because the encoding is resolved from the
         locale at interpreter start and cannot be patched afterwards.
+
+        Reproduced through a POSIX locale. Windows takes its preferred encoding
+        from the active code page, which these variables do not set, so there
+        the test passes without exercising the case.
         """
         script = (
             "import sys; sys.path.insert(0, %r);"
@@ -679,6 +702,9 @@ class TestInstallerVerification(unittest.TestCase):
         self.assertTrue(result.stdout.startswith("(True,"), result.stdout)
 
     def test_verify_rejects_a_silent_command(self):
+        # `true` exists only on Unix. Windows reaches the same result through the
+        # unrunnable-command branch, so the empty-output branch is covered only
+        # off Windows.
         ok, _ = install.verify(install.Candidate(["true"], ["true"]))
         self.assertFalse(ok)
 

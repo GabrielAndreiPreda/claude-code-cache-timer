@@ -1,0 +1,64 @@
+name: Tests
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+# The status line has no runtime dependencies and CI needs nothing from the API.
+permissions:
+  contents: read
+
+jobs:
+  test:
+    name: Python ${{ matrix.python }} on ${{ matrix.os }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      # Report every platform, rather than stopping at the first failure.
+      fail-fast: false
+      matrix:
+        include:
+          # setup-python has no 3.8 build for the 24.04 image ubuntu-latest now
+          # resolves to, so the floor declared in pyproject.toml is tested on a
+          # pinned 22.04 runner.
+          - { os: ubuntu-22.04, python: "3.8" }
+          - { os: ubuntu-latest, python: "3.9" }
+          - { os: ubuntu-latest, python: "3.11" }
+          - { os: ubuntu-latest, python: "3.13" }
+          # Windows covers the code page and path separator differences.
+          - { os: windows-latest, python: "3.8" }
+          - { os: windows-latest, python: "3.13" }
+          - { os: macos-latest, python: "3.13" }
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: actions/setup-python@v7
+        with:
+          python-version: ${{ matrix.python }}
+
+      - name: Run tests
+        run: python -m unittest discover -s tests -v
+
+  build:
+    name: Build the package
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: actions/setup-python@v7
+        with:
+          python-version: "3.13"
+
+      - name: Build wheel and sdist
+        run: |
+          python -m pip install --upgrade build twine
+          python -m build
+          # Catches metadata that is valid TOML but invalid packaging.
+          python -m twine check dist/*
+
+      - name: Install the wheel and run the console script
+        run: |
+          python -m pip install dist/*.whl
+          claude-cache-timer --version
+          claude-cache-timer --help

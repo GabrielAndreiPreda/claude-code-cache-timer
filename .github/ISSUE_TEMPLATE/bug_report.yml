@@ -1,0 +1,89 @@
+name: Bug report
+description: The status line shows something wrong, or the installer failed.
+labels: ["bug"]
+body:
+  - type: textarea
+    id: what-happened
+    attributes:
+      label: What happened
+      description: What the status line showed, or what the installer printed.
+      placeholder: The countdown showed 58:12 on a session I had left idle overnight.
+    validations:
+      required: true
+
+  - type: textarea
+    id: expected
+    attributes:
+      label: What you expected instead
+    validations:
+      required: true
+
+  - type: input
+    id: os
+    attributes:
+      label: Operating system
+      description: >
+        Include whether you are in WSL. WSL and Windows have separate home
+        directories and need separate installs.
+      placeholder: Windows 11, running Claude Code inside WSL2 (Ubuntu 24.04)
+    validations:
+      required: true
+
+  - type: input
+    id: python
+    attributes:
+      label: Python version
+      description: Output of `python3 --version`.
+      placeholder: "3.11.9"
+    validations:
+      required: true
+
+  - type: input
+    id: claude-code
+    attributes:
+      label: Claude Code version
+      description: Output of `claude --version`.
+      placeholder: "2.1.220"
+    validations:
+      required: true
+
+  - type: dropdown
+    id: install-method
+    attributes:
+      label: How you installed it
+      options:
+        - uv tool install
+        - pipx install
+        - from a clone, without installing
+        - other (say which below)
+    validations:
+      required: true
+
+  - type: textarea
+    id: settings
+    attributes:
+      label: Your statusLine block
+      description: >
+        The `statusLine` key from `~/.claude/settings.json`. Paste the block
+        only, not the whole file, which may hold API keys or other settings you
+        would rather not publish.
+      render: json
+      placeholder: |
+        "statusLine": {
+          "type": "command",
+          "command": "claude-cache-timer",
+          "refreshInterval": 1
+        }
+    validations:
+      required: true
+
+  - type: textarea
+    id: extra
+    attributes:
+      label: Anything else
+      description: >
+        Your terminal emulator, if the problem is glyphs or colour. Relevant
+        transcript lines, if the countdown itself is wrong. Redact those first:
+        transcripts contain your conversation.
+    validations:
+      required: false

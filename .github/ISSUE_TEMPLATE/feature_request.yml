@@ -1,0 +1,29 @@
+name: Feature request
+description: Suggest something the status line should do differently.
+labels: ["enhancement"]
+body:
+  - type: textarea
+    id: problem
+    attributes:
+      label: What are you trying to work out that the display does not tell you
+      description: Describe the situation rather than the feature.
+    validations:
+      required: true
+
+  - type: textarea
+    id: proposal
+    attributes:
+      label: What you have in mind
+    validations:
+      required: false
+
+  - type: textarea
+    id: extra
+    attributes:
+      label: Anything else
+      description: >
+        The command runs once per second in every open session, so cost on the
+        render path is worth mentioning if your suggestion affects it. See
+        CONTRIBUTING.md.
+    validations:
+      required: false
