@@ -1,0 +1,12 @@
+blank_issues_enabled: false
+contact_links:
+  - name: How the timer knows what it knows
+    url: https://github.com/GabrielAndreiPreda/claude-code-cache-timer/blob/main/CACHE-MECHANISM.md
+    about: >
+      Where the number comes from, why the clock is the last assistant turn,
+      and why there are no hooks.
+  - name: Known limitations
+    url: https://github.com/GabrielAndreiPreda/claude-code-cache-timer/blob/main/README.md#limitations
+    about: >
+      The status line being hidden during permission prompts, and the countdown
+      reading slightly optimistic, are both already documented.
