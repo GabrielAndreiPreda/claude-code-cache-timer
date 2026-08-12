@@ -39,16 +39,17 @@ rather than a directory, are followed; a detached HEAD shows a short SHA.
 Requires Python 3.8 or newer. Linux, macOS, and Windows. No dependencies.
 
 ```sh
-uv tool install git+https://github.com/GabrielAndreiPreda/claude-code-cache-timer@v2.1.0
-# or: pipx install git+https://github.com/GabrielAndreiPreda/claude-code-cache-timer@v2.1.0
+uv tool install git+https://github.com/GabrielAndreiPreda/claude-code-cache-timer
+# or: pipx install git+https://github.com/GabrielAndreiPreda/claude-code-cache-timer
 
 claude-cache-timer install
 ```
 
 Then open a new Claude Code session.
 
-Drop the `@v2.1.0` to track `main` instead of pinning. To preview the change without
-writing anything, run `claude-cache-timer install --dry-run`.
+To pin a release rather than track `main`, append `@` and a tag from the
+[releases page](https://github.com/GabrielAndreiPreda/claude-code-cache-timer/releases).
+To preview the change without writing anything, run `claude-cache-timer install --dry-run`.
 
 The installer adds a `statusLine` entry to `~/.claude/settings.json` and copies the old
 file into `~/.claude/backups/` first. It changes nothing else and leaves your hooks and

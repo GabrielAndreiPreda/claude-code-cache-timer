@@ -41,8 +41,8 @@ does.
   script.
 - `CONTRIBUTING.md`, issue and pull request templates, and this changelog.
 - Package metadata: author, issue and changelog URLs, and per-version Python classifiers.
-- A `--version` flag entry in the README options table, and a pinned install form, since
-  installing from `main` gave no way to hold a version.
+- A `--version` flag entry in the README options table, and instructions for pinning an
+  install to a tag, since installing from `main` gave no way to hold a version.
 
 ### Changed
 
